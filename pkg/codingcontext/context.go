@@ -116,11 +116,11 @@ func parseNamespacedTaskName(taskName string) (string, string, error) {
 // New creates a new Context with the given options.
 func New(opts ...Option) *Context {
 	c := &Context{
-		params:      make(taskparser.Params),
-		includes:    make(selectors.Selectors),
-		rules:       make([]markdown.Markdown[markdown.RuleFrontMatter], 0),
-		skills:      skills.AvailableSkills{Skills: make([]skills.Skill, 0)},
-		logger:      slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		params:           make(taskparser.Params),
+		includes:         make(selectors.Selectors),
+		rules:            make([]markdown.Markdown[markdown.RuleFrontMatter], 0),
+		skills:           skills.AvailableSkills{Skills: make([]skills.Skill, 0)},
+		logger:           slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		doBootstrap:      true, // Default to true for backward compatibility
 		includeByDefault: true, // Default to true for backward compatibility
 		cmdRunner: func(cmd *exec.Cmd) error {
@@ -143,6 +143,28 @@ func nameFromPath(path string) string {
 }
 
 type markdownVisitor func(path string, fm *markdown.BaseFrontMatter) error
+
+// A ruleFileError names the rule file involved in a discovery or bootstrap failure.
+type ruleFileError struct {
+	path string
+	err  error
+}
+
+func (e *ruleFileError) Error() string {
+	return fmt.Sprintf("%s: %s", e.path, e.err)
+}
+
+func (e *ruleFileError) Unwrap() error {
+	return e.err
+}
+
+// pendingRule is a parsed, expanded rule that has not been bootstrapped yet.
+type pendingRule struct {
+	path   string
+	md     markdown.Markdown[markdown.RuleFrontMatter]
+	reason string // selector match explanation
+	tokens int
+}
 
 // Run executes the context assembly for the given taskName and returns the assembled result.
 // The taskName is looked up in task search paths and its content is parsed into blocks.
@@ -803,8 +825,12 @@ func (cc *Context) cleanupDownloadedDirectories() {
 	}
 }
 
+// findExecuteRuleFiles discovers rule files in each rule directory, then
+// bootstraps and publishes them. Discovery of one directory finishes before
+// any of that directory's bootstrap scripts run. A lenient bootstrap failure
+// skips only that rule; a parse or expand error still stops discovery of the
+// rest of that directory.
 func (cc *Context) findExecuteRuleFiles(ctx context.Context) error {
-	// Skip rule file discovery if bootstrap is disabled
 	if !cc.doBootstrap {
 		return nil
 	}
@@ -813,51 +839,107 @@ func (cc *Context) findExecuteRuleFiles(ctx context.Context) error {
 		return namespacedRuleSearchPaths(dir, cc.namespace)
 	}
 
-	err := cc.visitMarkdownFiles(namespacedRulePaths, func(path string, baseFm *markdown.BaseFrontMatter) error {
-		var frontmatter markdown.RuleFrontMatter
+	for _, sp := range cc.downloadedPaths {
+		for _, dir := range namespacedRulePaths(sp.Path) {
+			var pending []pendingRule
 
-		md, err := markdown.ParseMarkdownFileWithLogger(path, &frontmatter, cc.logger)
-		if err != nil {
-			return fmt.Errorf("failed to parse markdown file %s: %w", path, err)
-		}
+			discoveryErr := cc.visitMarkdownInDir(dir, func(path string, baseFm *markdown.BaseFrontMatter) error {
+				rule, err := cc.discoverPendingRule(path, baseFm)
+				if err != nil {
+					return err
+				}
 
-		if cc.lintCollector != nil {
-			cc.lintCollector.recordFile(path, LoadedFileKindRule)
-		}
+				pending = append(pending, rule)
 
-		if frontmatter.Name == "" {
-			frontmatter.Name = nameFromPath(path)
-		}
+				return nil
+			})
+			if discoveryErr != nil {
+				if !sp.Lenient {
+					return discoveryErr
+				}
 
-		// Expand parameters only if expand is not explicitly set to false
-		var processedContent string
-		if shouldExpandParams(frontmatter.ExpandParams) {
-			processedContent, err = cc.expandParams(md.Content, nil)
-			if err != nil {
-				return fmt.Errorf("failed to expand parameters in file %s: %w", path, err)
+				cc.logger.Warn("stopping rule discovery after error", "path", dir, "error", discoveryErr)
 			}
-		} else {
-			processedContent = md.Content
+
+			if err := cc.bootstrapAndPublishRules(ctx, pending, sp.Lenient); err != nil {
+				return err
+			}
 		}
+	}
 
-		tokens := tokencount.EstimateTokens(processedContent)
+	return nil
+}
 
-		cc.rules = append(cc.rules, markdown.FromContent(frontmatter, processedContent))
+// discoverPendingRule parses and expands a rule file without running its bootstrap script.
+func (cc *Context) discoverPendingRule(
+	path string,
+	baseFm *markdown.BaseFrontMatter,
+) (pendingRule, error) {
+	var frontmatter markdown.RuleFrontMatter
 
-		cc.totalTokens += tokens
-
-		// Get match reason to explain why this rule was included
-		_, reason := cc.includes.MatchesIncludes(*baseFm, cc.includeByDefault)
-		cc.logger.Info("Including rule file", "path", path, "reason", reason, "tokens", tokens)
-
-		if err := cc.runBootstrapScript(ctx, path, frontmatter.Bootstrap); err != nil {
-			return fmt.Errorf("failed to run bootstrap script: %w", err)
-		}
-
-		return nil
-	})
+	md, err := markdown.ParseMarkdownFileWithLogger(path, &frontmatter, cc.logger)
 	if err != nil {
-		return fmt.Errorf("failed to find and execute rule files: %w", err)
+		return pendingRule{}, &ruleFileError{path: path, err: fmt.Errorf("parse markdown file: %w", err)}
+	}
+
+	if cc.lintCollector != nil {
+		cc.lintCollector.recordFile(path, LoadedFileKindRule)
+	}
+
+	if frontmatter.Name == "" {
+		frontmatter.Name = nameFromPath(path)
+	}
+
+	processedContent := md.Content
+	if shouldExpandParams(frontmatter.ExpandParams) {
+		processedContent, err = cc.expandParams(md.Content, nil)
+		if err != nil {
+			return pendingRule{}, &ruleFileError{path: path, err: fmt.Errorf("expand parameters: %w", err)}
+		}
+	}
+
+	tokens := tokencount.EstimateTokens(processedContent)
+	_, reason := cc.includes.MatchesIncludes(*baseFm, cc.includeByDefault)
+
+	return pendingRule{
+		path:   path,
+		md:     markdown.FromContent(frontmatter, processedContent),
+		reason: reason,
+		tokens: tokens,
+	}, nil
+}
+
+// bootstrapAndPublishRules runs each pending rule's bootstrap script and, on
+// success, publishes the rule. When lenient is true, a bootstrap failure logs
+// a warning and continues with the remaining rules.
+func (cc *Context) bootstrapAndPublishRules(
+	ctx context.Context,
+	pending []pendingRule,
+	lenient bool,
+) error {
+	for _, rule := range pending {
+		if err := cc.runBootstrapScript(ctx, rule.path, rule.md.FrontMatter.Bootstrap); err != nil {
+			if lenient {
+				cc.logger.Warn(
+					"skipping rule file after bootstrap failure",
+					"path", rule.path,
+					"error", err,
+				)
+
+				continue
+			}
+
+			return &ruleFileError{path: rule.path, err: fmt.Errorf("run bootstrap script: %w", err)}
+		}
+
+		cc.rules = append(cc.rules, rule.md)
+		cc.totalTokens += rule.tokens
+		cc.logger.Info(
+			"Including rule file",
+			"path", rule.path,
+			"reason", rule.reason,
+			"tokens", rule.tokens,
+		)
 	}
 
 	return nil
